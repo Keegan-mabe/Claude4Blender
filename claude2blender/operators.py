@@ -6,7 +6,7 @@ from bpy.props import CollectionProperty, EnumProperty, IntProperty, StringPrope
 from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper
 
-from . import bridge, claude_cli, guard, history, materials, scene_tools
+from . import bridge, claude_cli, guard, history, materials, presets, refmatch, scene_tools
 from .properties import REFERENCE_ROLES, get_state, permissions_for
 from .references import IMAGE_EXTENSIONS, is_image
 
@@ -58,6 +58,127 @@ class C2B_OT_send(Operator):
         else:
             self.report({"INFO"}, "Request copied. Paste it into Claude Desktop (Cmd/Ctrl+V)")
         state.status = "Request copied to clipboard. Paste it into Claude Desktop."
+        return {"FINISHED"}
+
+
+class C2B_OT_stage_preset(Operator):
+    """Stage the chosen studio material for the selected objects or faces. Preview and Apply it like any change"""
+    bl_idname = "claude2blender.stage_preset"
+    bl_label = "Use Preset"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return history.preview_entry() is None
+
+    def execute(self, context):
+        state = get_state(context)
+        key = state.preset
+        request, _text = bridge.send_request(context, copy_to_clipboard=False)
+        sel = request["selection"]
+        if not sel["objects"] and not sel["faces"]:
+            self.report({"WARNING"}, "Select objects, or faces in Edit Mode, first")
+            return {"CANCELLED"}
+        label = presets.PRESETS[key][0]
+        bridge._api.stage_proposal(presets.preset_code(key), f"Studio preset: {label}")
+        state.status = f"Staged preset {label}. Preview or Apply it below."
+        return {"FINISHED"}
+
+
+class C2B_OT_stage_style(Operator):
+    """Stage the chosen studio lighting look (lights, world, backdrop). Preview and Apply it like any change"""
+    bl_idname = "claude2blender.stage_style"
+    bl_label = "Use Style"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return history.preview_entry() is None
+
+    def execute(self, context):
+        state = get_state(context)
+        state.mode = "ENVIRONMENT"
+        bridge.send_request(context, copy_to_clipboard=False)
+        label = scene_tools.STUDIO_STYLES[state.studio_style]["label"]
+        bridge._api.stage_proposal(scene_tools.style_code(state.studio_style), f"Studio style: {label}")
+        state.status = f"Staged style {label}. Preview or Apply it below."
+        return {"FINISHED"}
+
+
+_match_job = None
+
+
+def match_running():
+    return _match_job is not None and not _match_job.done
+
+
+class C2B_OT_measure_lighting(Operator):
+    """Measure the reference photo's lighting: render your product under 25 test lights in the background, fit them to the photo, and stage the matching lights for review"""
+    bl_idname = "claude2blender.measure_lighting"
+    bl_label = "Measure Lighting"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return not match_running() and history.preview_entry() is None
+
+    def execute(self, context):
+        global _match_job
+        state = get_state(context)
+        refs = [r for r in state.references if os.path.isfile(bpy.path.abspath(r.filepath))]
+        ref = next((r for r in refs if r.role == "ENVIRONMENT"), refs[0] if refs else None)
+        if ref is None:
+            self.report({"WARNING"}, "Add a reference photo first (role: Environment)")
+            return {"CANCELLED"}
+        names = [o.name for o in context.selected_objects if o.type in {"MESH", "CURVE", "FONT", "SURFACE"}]
+        if not names:
+            names = [o.name for o in context.scene.objects
+                     if o.type == "MESH" and o.visible_get() and not scene_tools.is_generated(o)]
+        if not names:
+            self.report({"WARNING"}, "Nothing to light: select the product")
+            return {"CANCELLED"}
+        state.mode = "ENVIRONMENT"
+        try:
+            _match_job = refmatch.start_match(context, bpy.path.abspath(ref.filepath), names)
+        except RuntimeError as exc:
+            self.report({"WARNING"}, str(exc))
+            return {"CANCELLED"}
+        state.status = _match_job.status
+        bpy.app.timers.register(_poll_match, first_interval=1.0)
+        return {"FINISHED"}
+
+
+def _poll_match():
+    global _match_job
+    job = _match_job
+    if job is None:
+        return None
+    state = get_state(bpy.context)
+    if not job.done:
+        if state.status != job.status:
+            state.status = job.status
+            bridge._redraw()
+        return 1.0
+    if job.error:
+        state.status = f"Lighting match failed: {job.error}"
+    else:
+        bridge.send_request(bpy.context, copy_to_clipboard=False)
+        summary = "Measured lighting match: " + refmatch.describe(job.result)
+        bridge._api.stage_proposal(refmatch.match_code(job.result), summary)
+        state.status = "Lighting measured and staged. Preview or Apply it below."
+    bridge._redraw()
+    return None
+
+
+class C2B_OT_cancel_measure(Operator):
+    """Stop the lighting measurement"""
+    bl_idname = "claude2blender.cancel_measure"
+    bl_label = "Cancel"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        if _match_job is not None:
+            _match_job.cancel()
         return {"FINISHED"}
 
 
@@ -397,6 +518,7 @@ def run_change(op, context, code, summary, request, preview=False):
         "expand_indices": bridge.expand_indices,
         "assign_material": lambda mat: materials.assign_material(mat, request, notes),
         "c2b": scene_tools.helpers,
+        "preset_material": presets.preset_material,
     }
     try:
         exec(compile(code, "<claude2blender proposal>", "exec"), namespace)
@@ -785,6 +907,10 @@ _classes = (
     C2B_OT_edit_prompt,
     C2B_OT_clear_prompt,
     C2B_OT_send,
+    C2B_OT_stage_preset,
+    C2B_OT_stage_style,
+    C2B_OT_measure_lighting,
+    C2B_OT_cancel_measure,
     C2B_OT_generate,
     C2B_OT_cancel_generate,
     C2B_OT_new_conversation,

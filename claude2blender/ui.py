@@ -64,8 +64,24 @@ class C2B_PT_main(_Base, Panel):
         col = layout.column(align=True)
         col.label(text="Mode")
         col.row(align=True).prop(state, "mode", expand=True)
+        if state.mode == "ENVIRONMENT":
+            row = col.row(align=True)
+            row.prop(state, "studio_style", text="", icon="LIGHT_AREA")
+            row.operator("claude2blender.stage_style", text="Use Style", icon="IMPORT")
+            from . import operators as _ops
+            row = col.row(align=True)
+            if _ops.match_running():
+                row.label(text=state.status or "Measuring…", icon="TIME")
+                row.operator("claude2blender.cancel_measure", text="", icon="CANCEL")
+            else:
+                row.operator("claude2blender.measure_lighting", text="Measure Lighting from Reference",
+                             icon="LIGHT_AREA")
         if state.mode != "MATERIAL":
             _draw_permissions(col, context, state)
+        else:
+            row = col.row(align=True)
+            row.prop(state, "preset", text="", icon="MATERIAL")
+            row.operator("claude2blender.stage_preset", text="Use Preset", icon="IMPORT")
 
         layout.separator(factor=0.5)
 
