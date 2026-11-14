@@ -6,7 +6,7 @@ and press **Generate with Claude**. Claude's change shows up for review, and
 nothing runs until you press **Apply**. Every applied change goes into a
 History with Undo and Redo.
 
-What it can do (v0.5):
+What it can do (v0.6):
 
 * **Material matching.** Select an object, or faces in Edit Mode, add a photo
   of a material, and Claude builds a photorealistic shader for exactly that
@@ -36,11 +36,14 @@ plan. No API key is needed.
 * **Claude Code**, Anthropic's official command-line tool, signed in with a
   Claude **Pro, Max, Team or Enterprise** plan (or an Anthropic API key, if you
   prefer pay-as-you-go).
-* macOS or Linux. Windows should work but hasn't been tested yet.
+* macOS, Linux or Windows. The automated tests run on Windows 11 with Blender 5.3. On Windows the
+  add-on finds Claude Code from the native installer (`%USERPROFILE%\.local\bin\claude.exe`) or npm
+  (`%APPDATA%\npm\claude.cmd`). An npm `.cmd` is started as `node cli.js` so the prompt never passes
+  through cmd.exe, and very long prompts go through stdin to stay under Windows' command-line limit.
 
 ## Install
 
-1. **Download** `claude2blender-0.5.0.zip` from the [`dist/`](dist/claude2blender-0.5.0.zip)
+1. **Download** `claude2blender-0.6.0.zip` from the [`dist/`](dist/claude2blender-0.6.0.zip)
    folder of this repository (open the file, then press the download button). Don't unzip it.
 2. In Blender, open **Edit → Preferences → Add-ons**.
 3. Blender 4.2 or newer: click the **⌄** menu at the top right and choose
@@ -158,6 +161,51 @@ calls `assign_material(mat)`, which the add-on provides:
   object-level override so the others don't change.
 * Face targets on a mesh shared by linked duplicates can't be isolated, because
   the faces are the same data. The panel warns you when that happens.
+
+### Studio presets
+
+In Material mode, pick a preset from the dropdown under the mode (white dry-blast ABS, soft-touch
+black, vulcanized black, TPE, dot-grid rubber, brushed steel, scuffed copper, clear resin, PCB, glass,
+aluminium and more) and press **Use Preset**. No Claude call is made; the change is staged so you can
+Preview, Apply and Undo it like any other. Claude can also start from a preset
+(`preset_material("soft_touch_black")`) when your prompt matches one.
+
+Presets use texture packs when they are installed: set **Texture Library** in the add-on preferences
+to the folder holding them (for example `worn-old-plastic-bl`, `Copper-scuffed_bl` or Poliigon folders,
+up to two levels deep). The preferences list which packs were found. Without a pack, the preset uses
+procedural grain.
+
+### Studio styles
+
+In Environment mode, pick **Dark studio**, **High-key white** or **Colour gradient** from the dropdown
+and press **Use Style**. These are Blender Director's tuned looks: lights placed around your product
+relative to the scene camera and sized from the product (same look at any scale), a studio world, a
+floor or sweep, and for Colour gradient a glowing orange-to-red wall. No Claude call is made. Like any
+change it is staged for Preview / Apply / Undo and checked against Allowed Changes. Switching styles
+reuses the same lights and hides the ones the new look doesn't use; your own lights are never changed.
+Claude can start from them too (`c2b.studio_style("dark")`). Sample renders: `tests/real_results/style_*.png`.
+
+### Measured lighting match
+
+In Environment mode, add a reference photo and press **Measure Lighting from Reference**. Instead of
+estimating, it measures:
+
+1. A background Blender renders a temporary copy of your scene through your camera under 25 soft test
+   lights (3 rings of 8 plus overhead) and a neutral world, each in its own light group. Your file is not
+   changed and Blender stays usable; the panel shows progress and a cancel button.
+2. A least-squares fit finds how strong and what colour each test light must be to reproduce the
+   photo's shading pattern on your product, its rims and the background.
+3. The lights that matter are staged as real area lights (`C2B Match L07`, ...) plus a studio world,
+   for Preview / Apply / Undo. Exposure is folded into the light energies, so your colour management
+   is untouched. The summary names the strongest light directions and the fit residuals (lower is
+   closer; no match percentage is claimed). Claude refines these lights by name in follow-ups.
+
+Limits: it matches light direction, balance and colour, not the camera angle, props or backdrop
+shape. Lights come from a fixed 25-light dome, so a key between two rings is split between them and
+tends to land in the lower one. A reference with a very busy or uneven background may not separate
+cleanly from the product. Your own lights stay on (they aren't part of the fit), so switch them off
+for a true comparison. Test and side-by-side: `tests/test_refmatch.py`,
+`tests/real_results/refmatch_reference.png` vs `refmatch_matched.png`.
 
 ### Environment matching
 
@@ -460,7 +508,7 @@ Claude4Blender/
 │   ├── operators.py          send, references, review/apply, history ops, Preserve Geometry guard
 │   ├── references.py         thumbnail previews
 │   └── ui.py                 sidebar panels
-├── dist/claude2blender-0.5.0.zip   ready-to-install zip
+├── dist/claude2blender-0.6.0.zip   ready-to-install zip
 ├── tests/                    headless tests (no user files opened)
 └── build_zip.sh
 ```
@@ -477,6 +525,11 @@ python tests/test_materials.py           # faces/objects, preview, saving, image
                                          # a real run on a rendered copper photo
 python tests/test_scene.py               # v0.5 sample scenes: lighting, camera angle, exploded view,
                                          # refinements, undo/redo, Allowed Changes, Original/Proposed
+python tests/test_presets.py             # studio material presets, texture packs, Use Preset
+python tests/test_styles.py              # studio styles; C2B_STYLE_RENDERS=<dir> renders each style
+python tests/test_refmatch.py            # measured lighting match on a rendered reference (C2B_GPU=1)
+# The stand-in CLI (tests/fake_cli.py) is a shebang script on macOS/Linux and an npm-style
+# claude.cmd shim on Windows, so the same tests run on both.
 C2B_REAL_CLAUDE=1 python tests/test_scene_real.py   # real Claude on rendered environment and
                                                     # composition references, with follow-ups
                                                     # (renders from the last run: tests/real_results/)

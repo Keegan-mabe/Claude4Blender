@@ -15,15 +15,17 @@
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import threading
 import time
 
 import bpy
 
-from . import bridge, history, materials
+from . import bridge, history, materials, presets
 from .properties import get_state
 
 READABLE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
@@ -116,12 +118,24 @@ Material matching from photographs (when there are reference images):
 - Be honest about the match: set material.match to "needs_texture_maps" when an exact photographic match
   (e.g. a specific wood figure, print, or logo) would need scanned/PBR texture maps, and say so briefly in
   material.limitations. Never claim a perfect match.
-- Refinements: `target_materials` holds the current node trees."""
+- Refinements: `target_materials` holds the current node trees.
+
+Studio presets: `preset_material(key, name=None, color=None)` returns a tuned, ready-to-render material
+(rebuilt in place by name; uses the user's texture packs when installed, procedural grain otherwise). When the
+request clearly matches one (e.g. "soft-touch black", "brushed steel screws", "PCB copper"), start from it:
+`assign_material(preset_material("soft_touch_black", color=(...)))`, or build on its node tree. Keys:
+""" + presets.prompt_list()
 
 SCENE_HELPERS_PROMPT = """Scene helpers (`c2b`), all in world space, metres, +Z up, angles in radians:
 - c2b.light(name, kind="AREA"|"SPOT"|"POINT"|"SUN", location=(x,y,z), target=point_or_object, energy=W,
   color="#RRGGBB", size=m, size_y=m, shape="RECTANGLE"|"DISK"|"ELLIPSE"|"SQUARE", spread=rad,
   spot_size=rad, spot_blend=0-1, angle=rad (sun)) -> creates or updates that light (no duplicates).
+- c2b.studio_style("dark"|"highkey"|"gradient", strength=1.0) -> a tuned studio look in one call (lights named
+  "C2B Style ...", world, floor/sweep, and for gradient a glowing wall), placed around the targets relative to
+  the scene camera. A good starting point when the request names a look like these; then refine with c2b.light.
+- Lights named "C2B Match L00".."L24" come from the panel's measured lighting match (fitted to the reference
+  with a light basis). When the user refines a measured match ("softer", "warmer key"), adjust those lights
+  by name rather than replacing them.
 - c2b.studio_world(top="#hex", bottom="#hex", strength=1.0, camera_color=None|"#hex", camera_strength=1.0,
   horizon=0.5, name="C2B Studio World") -> procedural gradient world, assigned to the scene. camera_color lets
   the visible background differ from the light the world gives.
@@ -202,13 +216,23 @@ def prefs():
 
 
 _login_path = None
+IS_WINDOWS = os.name == "nt"
+# Windows: keep each run from flashing a console window.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}
+# CreateProcess limits a command line to 32767 characters; longer prompts go through stdin.
+WIN_ARG_LIMIT = 30000
 
 
 def login_shell_path():
-    """PATH as your Terminal sees it (apps opened from the Dock get a minimal PATH)."""
+    """PATH as your Terminal sees it (apps opened from the Dock get a minimal PATH).
+
+    macOS/Linux only. Windows apps already get the user's PATH, and there is no login shell to ask.
+    """
     global _login_path
     if _login_path is None:
         _login_path = ""
+        if IS_WINDOWS:
+            return _login_path
         shell = os.environ.get("SHELL") or ("/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/bash")
         try:
             out = subprocess.run([shell, "-lic", "printf '%s' \"$PATH\""], capture_output=True, text=True,
@@ -229,12 +253,69 @@ def find_cli(configured=""):
     if found:
         return found
     home = os.path.expanduser("~")
-    for path in (f"{home}/.local/bin/claude", f"{home}/.claude/local/claude", "/opt/homebrew/bin/claude",
-                 "/usr/local/bin/claude", f"{home}/.npm-global/bin/claude",
-                 os.path.join(home, ".local", "bin", "claude.exe")):  # Windows native installer
+    if IS_WINDOWS:
+        appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        spots = (os.path.join(home, ".local", "bin", "claude.exe"),       # native installer (install.ps1)
+                 os.path.join(home, ".claude", "local", "claude.exe"),
+                 os.path.join(appdata, "npm", "claude.cmd"))             # npm install -g
+    else:
+        spots = (f"{home}/.local/bin/claude", f"{home}/.claude/local/claude", "/opt/homebrew/bin/claude",
+                 "/usr/local/bin/claude", f"{home}/.npm-global/bin/claude")
+    for path in spots:
         if os.path.isfile(path):
             return path
     return None
+
+
+_SHIM_TARGET = re.compile(r'"%(?:~)?dp0%?\\?([^"%]+\.(?:js|mjs|cjs|py))"', re.IGNORECASE)
+
+
+def _resolve_shim(path):
+    """The script behind an npm-style .cmd shim, e.g. node_modules\\@anthropic-ai\\claude-code\\cli.js."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(8192)
+    except OSError:
+        return None
+    base = os.path.dirname(path)
+    for rel in _SHIM_TARGET.findall(text):
+        target = os.path.normpath(os.path.join(base, rel.lstrip("\\/")))
+        if os.path.isfile(target):
+            return target
+    return None
+
+
+def _interpreter_for(script):
+    ext = os.path.splitext(script)[1].lower()
+    if ext == ".py":
+        return sys.executable   # Blender's own Python
+    base = os.path.dirname(script)
+    for cand in (os.path.join(base, "node.exe"), os.path.join(os.path.dirname(base), "node.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return shutil.which("node")
+
+
+def launch_command(cli):
+    """argv prefix that starts the CLI.
+
+    macOS/Linux: the executable itself. Windows: a .exe runs directly; a .cmd/.bat shim (npm) is
+    resolved to `node cli.js`, because cmd.exe re-parses arguments and would mangle the multi-line
+    prompt and JSON. Plain .js/.py scripts get their interpreter.
+    """
+    ext = os.path.splitext(cli)[1].lower()
+    if IS_WINDOWS and ext in (".cmd", ".bat"):
+        script = _resolve_shim(cli)
+        if script:
+            interp = _interpreter_for(script)
+            if interp:
+                return [interp, script]
+        return [cli]
+    if ext in (".js", ".mjs", ".cjs", ".py") and (IS_WINDOWS or not os.access(cli, os.X_OK)):
+        interp = _interpreter_for(cli)
+        if interp:
+            return [interp, cli]
+    return [cli]
 
 
 def child_env(ignore_api_key=True):
@@ -264,6 +345,8 @@ class Job:
         self.timeout = timeout
         self.events = queue.Queue()
         self.proc = None
+        self.stdin_text = None   # prompt sent on stdin instead of argv (Windows length limit)
+        self.launch = list(args[:1]) if args else []   # argv prefix that starts the CLI
         self.cancelled = False
         self.started = time.time()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -293,8 +376,13 @@ class Job:
                 self.events.put(("done", None))
                 return
         try:
-            self.proc = subprocess.Popen(self.args, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            self.proc = subprocess.Popen(self.args, cwd=self.cwd, env=self.env,
+                                         stdin=subprocess.PIPE if self.stdin_text is not None else subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                         encoding="utf-8", errors="replace", **_NO_WINDOW)
+            if self.stdin_text is not None:
+                self.proc.stdin.write(self.stdin_text)
+                self.proc.stdin.close()
         except OSError as exc:
             self.events.put(("error", f"Could not start Claude Code: {exc}"))
             self.events.put(("done", None))
@@ -320,8 +408,9 @@ class Job:
             killer.cancel()
         if self.kind == "check":
             try:
-                out = subprocess.run([self.args[0], "--version"], capture_output=True, text=True, timeout=20,
-                                     stdin=subprocess.DEVNULL, env=self.env, cwd=self.cwd).stdout.strip()
+                out = subprocess.run([*self.launch, "--version"], capture_output=True, text=True, timeout=20,
+                                     stdin=subprocess.DEVNULL, env=self.env, cwd=self.cwd,
+                                     encoding="utf-8", errors="replace", **_NO_WINDOW).stdout.strip()
                 self.events.put(("version", out))
             except Exception:
                 pass
@@ -408,7 +497,7 @@ def run_conversions(conversions, events=None, env=None):
             events.put(("status", f"Preparing {os.path.basename(src)}…"))
         try:
             r = subprocess.run(_converter_command(src, dst), capture_output=True, text=True, timeout=120,
-                               stdin=subprocess.DEVNULL, env=env)
+                               stdin=subprocess.DEVNULL, env=env, **_NO_WINDOW)
             if "C2B_OK" not in r.stdout or not os.path.isfile(dst):
                 failed.append(src)
         except Exception:
@@ -466,7 +555,9 @@ def start_generate(context):
         if failed:
             job.events.put(("note", f"Could not read {len(failed)} reference image(s)"))
         prompt = build_prompt(request, usable, follow_up)
-        args = [cli, "-p", prompt,
+        launch = launch_command(cli)
+        job.launch = launch
+        args = [*launch, "-p", prompt,
                 "--output-format", "stream-json", "--verbose",
                 "--json-schema", json.dumps(RESULT_SCHEMA),
                 "--append-system-prompt", system_prompt(request["mode"]),
@@ -481,6 +572,10 @@ def start_generate(context):
             args += ["--model", model]
         if session:
             args += ["--resume", session]
+        if IS_WINDOWS and len(subprocess.list2cmdline(args)) > WIN_ARG_LIMIT:
+            # Too long for a Windows command line: `claude -p` reads the prompt from stdin instead.
+            args.pop(len(launch) + 1)
+            job.stdin_text = prompt
         job.args = args
 
     timeout = (p.timeout_minutes if p else 5) * 60
@@ -522,8 +617,10 @@ def start_check(context):
         state.cli_status = "Claude Code CLI not found"
         state.cli_ok = False
         return None
-    script = [cli, "auth", "status"]
+    launch = launch_command(cli)
+    script = [*launch, "auth", "status"]
     _job = Job("check", script, child_env(p.ignore_api_key if p else True), workspace_dir(), 60)
+    _job.launch = launch
     state.cli_status = "Checking Claude Code…"
     _job.start()
     _ensure_timer()
@@ -766,6 +863,13 @@ class C2B_Preferences(bpy.types.AddonPreferences):
         default=True,
     )
 
+    texture_library: bpy.props.StringProperty(
+        name="Texture Library",
+        description=("Folder holding texture packs for the studio presets (e.g. worn-old-plastic-bl, "
+                     "Copper-scuffed_bl, Poliigon folders). Presets without their pack use procedural grain"),
+        subtype="DIR_PATH",
+    )
+
     def draw(self, context):
         layout = self.layout
         state = get_state(context)
@@ -780,6 +884,13 @@ class C2B_Preferences(bpy.types.AddonPreferences):
         row.operator("claude2blender.check_cli", icon="FILE_REFRESH")
         if state.cli_status:
             row.label(text=state.cli_status)
+        box = layout.box()
+        box.prop(self, "texture_library")
+        col = box.column(align=True)
+        col.scale_y = 0.8
+        for _key, folder, ok in presets.pack_status(bpy.path.abspath(self.texture_library)):
+            col.label(text=f"{folder}: {'found' if ok else 'not found (procedural fallback)'}",
+                      icon="CHECKMARK" if ok else "DOT")
 
 
 def register():

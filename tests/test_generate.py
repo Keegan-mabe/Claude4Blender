@@ -21,6 +21,7 @@ import claude2blender as addon  # noqa: E402
 addon.register()
 from claude2blender import claude_cli, history, ui  # noqa: E402
 sys.path.insert(0, HERE)
+import fake_cli  # noqa: E402
 
 
 class _L:
@@ -93,10 +94,7 @@ emit({"type": "result", "subtype": "success", "is_error": False, "result": json.
 tmp = tempfile.mkdtemp()
 fake_dir = os.path.join(tmp, "bin")
 os.makedirs(fake_dir)
-fake = os.path.join(fake_dir, "claude")
-with open(fake, "w") as fh:
-    fh.write(FAKE)
-os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+fake = fake_cli.install(fake_dir, FAKE)
 log = os.path.join(tmp, "calls.jsonl")
 mode_file = os.path.join(tmp, "mode")
 os.environ["FAKE_CLAUDE_LOG"] = log
@@ -129,7 +127,7 @@ r.filepath = ref
 r.role = "MATERIAL"
 state.prompt = "Make it blue"
 
-check(claude_cli.find_cli() == fake, "finds the CLI via the login-shell PATH")
+check(os.path.normcase(claude_cli.find_cli() or "") == os.path.normcase(fake),"finds the CLI via the login-shell PATH")
 
 # 1. Check Claude Code
 set_mode("ok")

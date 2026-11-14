@@ -8,7 +8,7 @@
 bl_info = {
     "name": "Claude2Blender",
     "author": "Talus / Claude2Blender",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar (N) > Claude",
     "description": "Prompt Claude from Blender's sidebar: materials, lighting and composition from references, with review and undo/redo history",

@@ -607,9 +607,158 @@ def movable():
     return [o for o in targets() if o.name in selected_names()]
 
 
+# ---------------------------------------------------------------- studio styles (from Blender Director)
+
+# Light offsets are (right, toward camera, up) in metres for a product of radius REF_RADIUS,
+# relative to the product centre and the camera's horizontal direction. They scale with the
+# product; energies scale with the square of that so the exposure stays the same.
+REF_RADIUS = 0.1
+STUDIO_STYLES = {
+    "dark": dict(
+        label="Dark studio", desc="Moody near-black set: big soft key, cool and warm rim strips, soft top fill",
+        world=dict(top=(0.02, 0.02, 0.022), strength=1.0),
+        floor=dict(color=(0.025, 0.025, 0.028), roughness=0.6),
+        lights=[("Key", (-0.55, 0.45, 0.55), 30, (0.6, 0.45), (1, 1, 1), None),
+                ("Rim L", (-0.45, -0.55, 0.25), 16, (0.12, 0.6), (0.85, 0.92, 1.0), None),
+                ("Rim R", (0.5, -0.5, 0.25), 16, (0.12, 0.6), (1.0, 0.93, 0.85), None),
+                ("Top", (0.0, 0.0, 0.7), 8, (0.7, 0.7), (1, 1, 1), None)]),
+    "highkey": dict(
+        label="High-key white", desc="Bright product-page look: white world and sweep, soft even light",
+        world=dict(top=(1, 1, 1), strength=0.3),
+        floor=dict(color=(0.80, 0.80, 0.81), roughness=0.4, sweep=True),
+        lights=[("Key", (-0.55, 0.45, 0.55), 9, (0.6, 0.45), (1, 1, 1), None),
+                ("Rim L", (-0.45, -0.55, 0.25), 4, (0.12, 0.6), (0.85, 0.92, 1.0), None),
+                ("Rim R", (0.5, -0.5, 0.25), 4, (0.12, 0.6), (1.0, 0.93, 0.85), None),
+                ("Top", (0.0, 0.0, 0.7), 1.5, (0.7, 0.7), (1, 1, 1), None)]),
+    "gradient": dict(
+        label="Colour gradient", desc="Dramatic set: glowing orange-to-red wall, cool blue key, hot red rim strip",
+        world=dict(top=(0.002, 0.002, 0.004), strength=1.0),
+        floor=dict(color=(0.0005, 0.0015, 0.012), roughness=0.4),
+        wall=dict(left=(1.0, 0.20, 0.02), mid=(0.75, 0.10, 0.03), right=(0.05, 0.004, 0.004), strength=2.2),
+        lights=[("Blue Key", (-0.40, 0.45, 0.30), 7, (0.5, 0.4), (0.25, 0.45, 1.0), 25),
+                ("Red Rim", (0.30, -0.35, 0.10), 14, (0.07, 0.45), (1.0, 0.08, 0.04), 25),
+                ("Orange Fill", (-0.50, -0.20, 0.15), 3, (0.4, 0.4), (1.0, 0.35, 0.08), 25)]),
+}
+STYLE_ITEMS = [(k, v["label"], v["desc"]) for k, v in STUDIO_STYLES.items()]
+_STYLE_PREFIX = "C2B Style "
+
+
+def _camera_frame(center):
+    """(forward, right) horizontal unit vectors from the scene camera toward `center`."""
+    bpy.context.view_layer.update()   # camera moved earlier in the same script: refresh matrix_world
+    cam = bpy.context.scene.camera
+    fwd = Vector((0, 1, 0))          # no camera: assume the Front view (camera on -Y)
+    if cam is not None:
+        d = center - cam.matrix_world.translation
+        d.z = 0
+        if d.length > 1e-6:
+            fwd = d.normalized()
+    right = fwd.cross(Vector((0, 0, 1))).normalized()
+    return fwd, right
+
+
+def _gradient_wall_material(name, wall, center, right, half_width):
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat[ROLE_KEY] = "backdrop"
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    geo = nt.nodes.new("ShaderNodeNewGeometry")
+    sub = nt.nodes.new("ShaderNodeVectorMath"); sub.operation = "SUBTRACT"
+    sub.inputs[1].default_value = center
+    dot = nt.nodes.new("ShaderNodeVectorMath"); dot.operation = "DOT_PRODUCT"
+    dot.inputs[1].default_value = right
+    nt.links.new(geo.outputs["Position"], sub.inputs[0])
+    nt.links.new(sub.outputs[0], dot.inputs[0])
+    mr = nt.nodes.new("ShaderNodeMapRange")
+    mr.inputs["From Min"].default_value = -half_width
+    mr.inputs["From Max"].default_value = half_width
+    nt.links.new(dot.outputs["Value"], mr.inputs["Value"])
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    els = ramp.color_ramp.elements
+    els[0].position, els[0].color = 0.0, (*wall["left"], 1)
+    els[1].position, els[1].color = 1.0, (*wall["right"], 1)
+    mid = els.new(0.5)
+    mid.color = (*wall["mid"], 1)
+    nt.links.new(mr.outputs["Result"], ramp.inputs["Fac"])
+    em = nt.nodes.new("ShaderNodeEmission")
+    em.inputs["Strength"].default_value = wall["strength"]
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(ramp.outputs["Color"], em.inputs["Color"])
+    nt.links.new(em.outputs[0], out.inputs["Surface"])
+    mat.diffuse_color = (*wall["mid"], 1)
+    return mat
+
+
+def studio_style(name="dark", strength=1.0):
+    """Light the targets with one of Blender Director's tuned studio looks.
+
+    name: 'dark', 'highkey' or 'gradient'. strength scales every light. Lights are
+    placed around the product relative to the scene camera and sized from the
+    product, so the look is the same at any scale. Re-running (or switching style)
+    updates the same lights and hides the ones the new look doesn't use. Your own
+    lights are never changed.
+    """
+    if name not in STUDIO_STYLES:
+        raise KeyError(f"Unknown style {name!r}. Styles: {', '.join(STUDIO_STYLES)}")
+    st = STUDIO_STYLES[name]
+    box = bounds()
+    center, radius = box["center"], max(box["radius"], 1e-4)
+    unit = bpy.context.scene.unit_settings.scale_length or 1.0
+    k = radius / REF_RADIUS                        # scene units per reference metre
+    energy_k = (radius * unit / REF_RADIUS) ** 2   # inverse-square: same light on the product
+    fwd, right = _camera_frame(center)
+    up = Vector((0, 0, 1))
+
+    used = set()
+    for lname, (r, t, u), watts, (w, h), col, spread in st["lights"]:
+        full = _STYLE_PREFIX + lname
+        used.add(full)
+        loc = center + (right * r - fwd * t + up * u) * k
+        extra = {"spread": math.radians(spread)} if spread else {}
+        light(full, "AREA", location=loc, target=center, energy=watts * energy_k * strength, color_=col,
+              size=w * k, size_y=h * k, shape="RECTANGLE", **extra)
+    for obj in bpy.data.objects:
+        if obj.type == "LIGHT" and obj.name.startswith(_STYLE_PREFIX) and obj.name not in used:
+            retire(obj)
+
+    studio_world(top=st["world"]["top"], strength=st["world"]["strength"])
+
+    fl = st["floor"]
+    span = radius * 2
+    # A flat floor and a sweep are different meshes, so each has its own object; the unused one is hidden.
+    floor_name, other = ("C2B Sweep", "C2B Floor") if fl.get("sweep") else ("C2B Floor", "C2B Sweep")
+    floor_obj = backdrop(floor_name, kind="sweep" if fl.get("sweep") else "floor",
+                         width=span * 30, depth=span * 30, height=span * 12 if fl.get("sweep") else None,
+                         color_=fl["color"], roughness=fl["roughness"], material_name=f"{floor_name} Material")
+    if bpy.data.objects.get(other) is not None:
+        retire(bpy.data.objects[other])
+    if fl.get("sweep"):
+        # the sweep's back wall faces the camera
+        floor_obj.rotation_euler = (0, 0, math.atan2(fwd.y, fwd.x) - math.pi / 2)
+
+    wall_obj = bpy.data.objects.get("C2B Gradient Wall")
+    if st.get("wall"):
+        wall_dist, wall_w, wall_h = radius * 7.5, span * 30, span * 20
+        wall_obj = backdrop("C2B Gradient Wall", kind="floor", width=wall_w, depth=wall_h,
+                            location=center + fwd * wall_dist + up * (wall_h / 2 - (center.z - box["min"].z)))
+        wall_obj.rotation_euler = (math.radians(90), 0, math.atan2(fwd.y, fwd.x) - math.pi / 2)
+        mat = _gradient_wall_material("C2B Gradient Wall Material", st["wall"], center, right, radius * 4.5)
+        wall_obj.data.materials[0] = mat
+    elif wall_obj is not None:
+        retire(wall_obj)
+    return st["label"]
+
+
+def style_code(name):
+    """Staged code for applying a studio style."""
+    return f"# Studio style: {STUDIO_STYLES[name]['label']}\nc2b.studio_style({name!r})\n"
+
+
 class Helpers:
     """The `c2b` object in staged code."""
 
+    studio_style = staticmethod(studio_style)
     color = staticmethod(color)
     light = staticmethod(light)
     camera = staticmethod(camera)

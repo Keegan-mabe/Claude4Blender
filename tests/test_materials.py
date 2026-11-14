@@ -23,6 +23,9 @@ import claude2blender as addon  # noqa: E402
 addon.register()
 from claude2blender import claude_cli, history, materials, ui  # noqa: E402
 
+sys.path.insert(0, HERE)
+import fake_cli  # noqa: E402
+
 api = bpy.app.driver_namespace["claude2blender"]
 state = bpy.context.window_manager.claude2blender
 scene = bpy.context.scene
@@ -288,9 +291,7 @@ emit({"type": "result", "subtype": "success", "is_error": False, "structured_out
 '''
 bindir = os.path.join(tmp, "bin")
 os.makedirs(bindir)
-fake = os.path.join(bindir, "claude")
-open(fake, "w").write(FAKE)
-os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+fake = fake_cli.install(bindir, FAKE)
 os.environ["FAKE_LOG"] = os.path.join(tmp, "log.jsonl")
 claude_cli._login_path = bindir
 state.references.clear()

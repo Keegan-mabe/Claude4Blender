@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "claude2blender"
-version = "0.5.0"
+version = "0.6.0"
 name = "Claude2Blender"
 tagline = "Prompt, selection and references for working with Claude"
 maintainer = "Talus"
@@ -11,9 +11,12 @@ blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
 
-tags = ["Interface", "Material", "Lighting"]
+tags = ["User Interface", "Material", "Lighting", "Render"]
 
 [permissions]
-files = "Reads reference images you pick and writes the last request to your Blender config folder"
-clipboard = "Copies the request for Claude Desktop to your clipboard (fallback)"
+files = "Reads your reference images and texture packs, writes temp files"
+clipboard = "Copies the request for Claude Desktop (optional fallback)"
 network = "Runs your installed Claude Code CLI, which talks to Claude"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", ".*"]
